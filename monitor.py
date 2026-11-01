@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
+import os
+import re
 import sqlite3
 import sys
+import argparse
 from datetime import datetime, timezone
 import httpx
 
@@ -17,13 +20,14 @@ logger = logging.getLogger("InfraPulse")
 DB_FILE = "infra_pulse.db"
 CONFIG_FILE = "targets.json"
 
-# Track previous states in memory to detect transitions (e.g., UP -> DOWN)
 previous_states = {}
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,11 +41,14 @@ def init_db():
         )
     """)
     
-    # Auto-migration check: add 'url' column if running against an older database version
     cursor.execute("PRAGMA table_info(audit_logs)")
     columns = [col[1] for col in cursor.fetchall()]
-    if "url" not in columns:
-        logger.info("Migrating database: adding missing 'url' column to audit_logs...")
+    
+    if "target_url" in columns and "url" not in columns:
+        logger.info("Migrating database: renaming 'target_url' to 'url'...")
+        cursor.execute("ALTER TABLE audit_logs RENAME COLUMN target_url TO url")
+    elif "url" not in columns:
+        logger.info("Migrating database: adding missing 'url' column...")
         cursor.execute("ALTER TABLE audit_logs ADD COLUMN url TEXT NOT NULL DEFAULT ''")
         
     conn.commit()
@@ -51,18 +58,52 @@ def init_db():
 def load_config():
     try:
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+            content = f.read()
+        
+        pattern = re.compile(r'\$\{([^}^{]+)\}')
+        def replace_env(match):
+            env_var = match.group(1)
+            val = os.environ.get(env_var, "")
+            if not val:
+                logger.warning(f"Environment variable '{env_var}' is empty or not set.")
+            return val
+            
+        resolved_content = pattern.sub(replace_env, content)
+        return json.loads(resolved_content)
     except Exception as e:
         logger.error(f"Failed to load configuration from {CONFIG_FILE}: {e}")
         sys.exit(1)
+
+
+def hydrate_initial_states(targets):
+    global previous_states
+    if not os.path.exists(DB_FILE):
+        return
+        
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10.0)
+        cursor = conn.cursor()
+        for target in targets:
+            name = target["name"]
+            cursor.execute("""
+                SELECT status FROM audit_logs 
+                WHERE target_name = ? 
+                ORDER BY id DESC LIMIT 1
+            """, (name,))
+            row = cursor.fetchone()
+            if row:
+                previous_states[name] = row[0]
+                logger.info(f"Hydrated state for '{name}': last known status was {row[0]}")
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to hydrate initial states from database: {e}")
 
 
 async def send_webhook(webhook_url: str, target_name: str, status: str, details: str):
     if not webhook_url:
         return
     
-    # Format payload for Discord / Slack compatible webhooks
-    color = 65280 if status == "UP" else 16711680  # Green for UP, Red for DOWN/DEGRADED
+    color = 65280 if status == "UP" else 16711680
     payload = {
         "content": f"🚨 **InfraPulse Alert**: `{target_name}` is now **{status}**!",
         "embeds": [
@@ -112,7 +153,6 @@ async def check_target(client: httpx.AsyncClient, target: dict, webhook_url: str
         status = "DOWN"
         error_msg = str(e)
 
-    # Check for state transition and trigger webhook if changed
     global previous_states
     last_state = previous_states.get(name)
     if last_state and last_state != status:
@@ -122,10 +162,9 @@ async def check_target(client: httpx.AsyncClient, target: dict, webhook_url: str
     
     previous_states[name] = status
 
-    # Log to SQLite
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=10.0)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -149,6 +188,8 @@ async def monitor_loop():
     interval = config.get("check_interval_seconds", 30)
     webhook_url = config.get("webhook_url", "")
 
+    hydrate_initial_states(targets)
+
     logger.info(f"Initialized database at {DB_FILE}. Monitoring {len(targets)} targets every {interval}s...")
 
     async with httpx.AsyncClient() as client:
@@ -158,11 +199,64 @@ async def monitor_loop():
             await asyncio.sleep(interval)
 
 
+def show_analytics():
+    if not os.path.exists(DB_FILE):
+        print("No audit database found (`infra_pulse.db`). Run the monitor first to collect metrics.")
+        return
+
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT DISTINCT target_name FROM audit_logs")
+    targets = [row[0] for row in cursor.fetchall()]
+
+    if not targets:
+        print("No monitoring logs found in the database yet.")
+        conn.close()
+        return
+
+    print("\n" + "=" * 65)
+    print("📊 INFRAPULSE MONITORING ANALYTICS REPORT")
+    print("=" * 65)
+
+    for name in targets:
+        cursor.execute("SELECT COUNT(*) FROM audit_logs WHERE target_name = ?", (name,))
+        total_checks = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM audit_logs WHERE target_name = ? AND status = 'UP'", (name,))
+        up_checks = cursor.fetchone()[0]
+
+        uptime_pct = (up_checks / total_checks * 100) if total_checks > 0 else 0.0
+
+        cursor.execute("SELECT AVG(latency_ms), MIN(latency_ms), MAX(latency_ms) FROM audit_logs WHERE target_name = ?", (name,))
+        lat_avg, lat_min, lat_max = cursor.fetchone()
+
+        cursor.execute("SELECT status, timestamp, error_message FROM audit_logs WHERE target_name = ? ORDER BY id DESC LIMIT 1", (name,))
+        last_status, last_time, last_err = cursor.fetchone()
+
+        print(f"\nTarget: {name}")
+        print(f"  • Current Status : {last_status} (As of {last_time} UTC)")
+        print(f"  • Uptime         : {uptime_pct:.2f}% ({up_checks}/{total_checks} checks successful)")
+        print(f"  • Latency (ms)   : Avg: {lat_avg:.2f}ms | Min: {lat_min:.2f}ms | Max: {lat_max:.2f}ms")
+        if last_err:
+            print(f"  • Last Error     : {last_err}")
+
+    print("\n" + "=" * 65 + "\n")
+    conn.close()
+
+
 def main():
-    try:
-        asyncio.run(monitor_loop())
-    except KeyboardInterrupt:
-        logger.info("InfraPulse Monitor stopped by user.")
+    parser = argparse.ArgumentParser(description="InfraPulse Monitor & Analytics Engine")
+    parser.add_argument("--analytics", action="store_true", help="Display historical uptime and latency analytics report")
+    args = parser.parse_args()
+
+    if args.analytics:
+        show_analytics()
+    else:
+        try:
+            asyncio.run(monitor_loop())
+        except KeyboardInterrupt:
+            logger.info("InfraPulse Monitor stopped by user.")
 
 
 if __name__ == "__main__":
