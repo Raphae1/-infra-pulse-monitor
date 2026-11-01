@@ -1,0 +1,19 @@
+{
+  "settings": {
+    "default_interval_seconds": 30,
+    "timeout_seconds": 5,
+    "db_path": "infra_pulse.db"
+  },
+  "targets": [
+    {
+      "name": "Google Main",
+      "url": "https://www.google.com",
+      "interval": 15
+    },
+    {
+      "name": "GitHub API Health",
+      "url": "https://api.github.com/zen",
+      "interval": 30
+    }
+  ]
+}
