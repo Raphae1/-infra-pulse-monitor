@@ -6,7 +6,10 @@ import re
 import sqlite3
 import sys
 import argparse
+import ssl
+import socket
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 import httpx
 
 # Configure logging
@@ -99,6 +102,26 @@ def hydrate_initial_states(targets):
         logger.error(f"Failed to hydrate initial states from database: {e}")
 
 
+def check_ssl_expiry(url: str):
+    """Check SSL certificate expiration days remaining for HTTPS endpoints."""
+    if not url.startswith("https://"):
+        return None
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port or 443
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, port), timeout=3.0) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+                not_after = cert.get('notAfter')
+                expiry_date = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                remaining_days = (expiry_date - datetime.utcnow()).days
+                return remaining_days
+    except Exception:
+        return None
+
+
 async def send_webhook(webhook_url: str, target_name: str, status: str, details: str):
     if not webhook_url:
         return
@@ -130,6 +153,7 @@ async def check_target(client: httpx.AsyncClient, target: dict, webhook_url: str
     url = target["url"]
     expected_status = target.get("expected_status", 200)
     timeout = target.get("timeout", 5.0)
+    min_ssl_days = target.get("min_ssl_days", 7)  # Warn if SSL expires in under 7 days
 
     start_time = asyncio.get_event_loop().time()
     status = "UP"
@@ -137,6 +161,7 @@ async def check_target(client: httpx.AsyncClient, target: dict, webhook_url: str
     error_msg = None
 
     try:
+        # Perform HTTP check
         response = await client.get(url, timeout=timeout, follow_redirects=True)
         latency = (asyncio.get_event_loop().time() - start_time) * 1000
         status_code = response.status_code
@@ -144,6 +169,14 @@ async def check_target(client: httpx.AsyncClient, target: dict, webhook_url: str
         if status_code != expected_status:
             status = "DEGRADED"
             error_msg = f"Expected status {expected_status}, got {status_code}"
+        
+        # Perform SSL Expiry Audit if HTTPS
+        ssl_days = check_ssl_expiry(url)
+        if ssl_days is not None and ssl_days < min_ssl_days:
+            status = "DEGRADED"
+            ssl_err = f"SSL certificate expires in {ssl_days} days!"
+            error_msg = f"{error_msg} | {ssl_err}" if error_msg else ssl_err
+
     except httpx.TimeoutException:
         latency = (asyncio.get_event_loop().time() - start_time) * 1000
         status = "DOWN"
@@ -190,7 +223,7 @@ async def monitor_loop():
 
     hydrate_initial_states(targets)
 
-    logger.info(f"Initialized database at {DB_FILE}. Monitoring {len(targets)} targets every {interval}s...")
+    logger.info(f"Initialized database at {DB_FILE}. Monitoring {len(targets)} targets every {interval}s (with SSL & DNS auditing)...")
 
     async with httpx.AsyncClient() as client:
         while True:
