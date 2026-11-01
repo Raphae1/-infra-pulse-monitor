@@ -3,7 +3,7 @@ import json
 import logging
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 
 # Configure logging
@@ -36,6 +36,14 @@ def init_db():
             error_message TEXT
         )
     """)
+    
+    # Auto-migration check: add 'url' column if running against an older database version
+    cursor.execute("PRAGMA table_info(audit_logs)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "url" not in columns:
+        logger.info("Migrating database: adding missing 'url' column to audit_logs...")
+        cursor.execute("ALTER TABLE audit_logs ADD COLUMN url TEXT NOT NULL DEFAULT ''")
+        
     conn.commit()
     conn.close()
 
@@ -49,7 +57,7 @@ def load_config():
         sys.exit(1)
 
 
-async def send_webhook(webhook_url: g, target_name: str, status: str, details: str):
+async def send_webhook(webhook_url: str, target_name: str, status: str, details: str):
     if not webhook_url:
         return
     
@@ -62,7 +70,7 @@ async def send_webhook(webhook_url: g, target_name: str, status: str, details: s
                 "title": f"Target Status: {status}",
                 "description": details,
                 "color": color,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         ]
     }
@@ -115,7 +123,7 @@ async def check_target(client: httpx.AsyncClient, target: dict, webhook_url: str
     previous_states[name] = status
 
     # Log to SQLite
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
