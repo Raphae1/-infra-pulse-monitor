@@ -1,19 +1,18 @@
 {
-  "settings": {
-    "default_interval_seconds": 30,
-    "timeout_seconds": 5,
-    "db_path": "infra_pulse.db"
-  },
+  "webhook_url": "YOUR_DISCORD_OR_SLACK_WEBHOOK_URL_HERE",
+  "check_interval_seconds": 30,
   "targets": [
     {
       "name": "Google Main",
       "url": "https://www.google.com",
-      "interval": 15
+      "expected_status": 200,
+      "timeout": 5.0
     },
     {
       "name": "GitHub API Health",
       "url": "https://api.github.com/zen",
-      "interval": 30
+      "expected_status": 200,
+      "timeout": 5.0
     }
   ]
 }
